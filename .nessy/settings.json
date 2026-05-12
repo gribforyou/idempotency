@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/users/i.lazovik/ideaprojects/idempotency/mvnw *)",
+      "Bash(mkdir *)",
+      "Bash(./mvnw *)"
+    ]
+  },
+  "$version": 3
+}
