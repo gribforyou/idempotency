@@ -8,6 +8,35 @@ import java.sql.*;
 import java.time.Duration;
 import java.util.*;
 
+/**
+ * JDBC-based implementation of {@link IdempotencyStore} for storing and managing idempotency records in a relational database.
+ * <p>
+ * This class provides thread-safe operations for:
+ * - Locking and retrieving active idempotency records with timeout handling
+ * - Saving successful results or errors with configurable TTL
+ * - Querying record state without locking
+ * <p>
+ * The underlying table must have the following columns:
+ * <ul>
+ *   <li>{@code record_key} (VARCHAR) - unique identifier for the idempotency key</li>
+ *   <li>{@code state} (VARCHAR) - current state: LOCKED, EXECUTED, or FAILED</li>
+ *   <li>{@code result_data} (TEXT) - JSON serialized result object (nullable)</li>
+ *   <li>{@code error_data} (TEXT) - JSON serialized error object (nullable)</li>
+ *   <li>{@code created_at} (BIGINT) - timestamp when record was created (milliseconds since epoch)</li>
+ *   <li>{@code ttl} (BIGINT) - time-to-live in milliseconds</li>
+ *   <li>{@code locked_until} (BIGINT) - timestamp when lock expires (nullable)</li>
+ * </ul>
+ * <p>
+ * Usage example:
+ * <pre>{@code
+ * JdbcIdempotencyStore<MyResponse> store = JdbcIdempotencyStore.<MyResponse>builder()
+ *     .dataSource(dataSource)
+ *     .resultType(MyResponse.class)
+ *     .build();
+ * }</pre>
+ *
+ * @param <T> the type of the result object to be serialized/deserialized
+ */
 public class JdbcIdempotencyStore<T> implements IdempotencyStore<T> {
 
     private static final Set<String> REQUIRED_COLUMNS = new HashSet<>(Arrays.asList(
@@ -19,6 +48,15 @@ public class JdbcIdempotencyStore<T> implements IdempotencyStore<T> {
     private final String tableName;
     private final Class<T> resultType;
 
+    /**
+     * Private constructor. Use {@link Builder} to create instances.
+     *
+     * @param dataSource   the JDBC data source for database connections
+     * @param objectMapper the ObjectMapper for JSON serialization/deserialization
+     * @param tableName    the name of the idempotency table in the database
+     * @param resultType   the Java class type for deserializing result objects
+     * @throws IllegalStateException if the table schema does not match requirements
+     */
     private JdbcIdempotencyStore(DataSource dataSource, ObjectMapper objectMapper, String tableName, Class<T> resultType) {
         this.dataSource = dataSource;
         this.objectMapper = objectMapper;
@@ -27,6 +65,14 @@ public class JdbcIdempotencyStore<T> implements IdempotencyStore<T> {
         validateSchema();
     }
 
+    /**
+     * Validates that the configured table contains all required columns for idempotency storage.
+     * <p>
+     * Checks for the presence of: record_key, state, result_data, error_data, created_at, ttl, locked_until.
+     * Throws an exception if the table does not exist or is missing any required columns.
+     *
+     * @throws IllegalStateException if schema validation fails
+     */
     private void validateSchema() {
         try (Connection connection = dataSource.getConnection()) {
             DatabaseMetaData metaData = connection.getMetaData();
@@ -51,6 +97,23 @@ public class JdbcIdempotencyStore<T> implements IdempotencyStore<T> {
         }
     }
 
+    /**
+     * Attempts to retrieve an active idempotency record or acquire a lock on it.
+     * <p>
+     * If the record does not exist, creates a new LOCKED record. If the record exists but is expired or
+     * in an invalid state (e.g., stale LOCKED, expired EXECUTED, or FAILED), resets it to LOCKED state.
+     * Otherwise, returns the existing record.
+     * <p>
+     * Uses database-level row locking ({@code FOR UPDATE}) to ensure thread safety.
+     * <p>
+     * The lock timeout defines how long the caller intends to hold the lock. If the lock expires
+     * before the operation completes, another caller may acquire it.
+     *
+     * @param key         the idempotency key to look up or lock
+     * @param lockTimeout the maximum duration to hold the lock before it expires
+     * @return an Optional containing the record if found and valid, or empty if a new lock was acquired
+     * @throws RuntimeException if a database error occurs
+     */
     @Override
     public Optional<IdempotencyRecord<T>> getActiveRecordOrLock(IdempotencyKey key, Duration lockTimeout) {
         long now = System.currentTimeMillis();
@@ -136,6 +199,16 @@ public class JdbcIdempotencyStore<T> implements IdempotencyStore<T> {
         }
     }
 
+    /**
+     * Inserts a new idempotency record in LOCKED state with a default TTL of 24 hours.
+     * <p>
+     * Used when no existing record is found for the given key.
+     *
+     * @param conn      the active database connection
+     * @param key       the idempotency key to insert
+     * @param lockUntil timestamp (milliseconds) when the lock expires
+     * @throws SQLException if the insert fails
+     */
     private void insertLockedRecord(Connection conn, IdempotencyKey key, long lockUntil) throws SQLException {
         long now = System.currentTimeMillis();
         long defaultTtl = Duration.ofHours(24).toMillis();
@@ -152,6 +225,18 @@ public class JdbcIdempotencyStore<T> implements IdempotencyStore<T> {
         conn.commit();
     }
 
+    /**
+     * Resets an existing idempotency record to LOCKED state, clearing any previous result or error.
+     * <p>
+     * Used when an existing record is found but is in an expired or invalid state (e.g., stale LOCKED,
+     * expired EXECUTED, or FAILED).
+     *
+     * @param conn      the active database connection
+     * @param key       the idempotency key to update
+     * @param lockUntil timestamp (milliseconds) when the new lock expires
+     * @param now       current timestamp (milliseconds) to set as the new creation time
+     * @throws SQLException if the update fails
+     */
     private void updateToLocked(Connection conn, IdempotencyKey key, long lockUntil, long now) throws SQLException {
         long defaultTtl = Duration.ofHours(24).toMillis();
 
@@ -168,6 +253,23 @@ public class JdbcIdempotencyStore<T> implements IdempotencyStore<T> {
         conn.commit();
     }
 
+    /**
+     * Saves a successful result for a locked idempotency record, transitioning it to EXECUTED state.
+     * <p>
+     * This method must be called only after successfully acquiring a lock via {@link #getActiveRecordOrLock}.
+     * If the record is not in LOCKED state, an exception is thrown.
+     * <p>
+     * The result object is serialized to JSON and stored. The lock is released by setting {@code locked_until} to NULL.
+     * The TTL is set to the provided duration.
+     *
+     * @param key        the idempotency key associated with the record
+     * @param result     the result object to store (must be serializable to JSON)
+     * @param defaultTtl the time-to-live for this record (must not be null)
+     * @return the saved record with updated state and metadata
+     * @throws IllegalArgumentException if defaultTtl is null
+     * @throws IllegalStateException    if the record is not in LOCKED state
+     * @throws RuntimeException         if serialization or database errors occur
+     */
     @Override
     public IdempotencyRecord<T> saveResult(IdempotencyKey key, T result, Duration defaultTtl) {
         if (defaultTtl == null) {
@@ -254,6 +356,25 @@ public class JdbcIdempotencyStore<T> implements IdempotencyStore<T> {
         }
     }
 
+    /**
+     * Saves an error for a locked idempotency record, transitioning it to FAILED state.
+     * <p>
+     * This method must be called only after successfully acquiring a lock via {@link #getActiveRecordOrLock}.
+     * If the record is not in LOCKED state, an exception is thrown.
+     * <p>
+     * The error object is serialized to JSON and stored. The lock is released by setting {@code locked_until} to NULL.
+     * The TTL is set to the provided duration.
+     * <p>
+     * If the error cannot be serialized as a Java object, it is serialized as a map containing class name and message.
+     *
+     * @param key        the idempotency key associated with the record
+     * @param error      the error object to store (must not be null)
+     * @param defaultTtl the time-to-live for this record (must not be null)
+     * @return the saved record with updated state and metadata
+     * @throws IllegalArgumentException if defaultTtl or error is null
+     * @throws IllegalStateException    if the record is not in LOCKED state
+     * @throws RuntimeException         if serialization or database errors occur
+     */
     @Override
     public IdempotencyRecord<T> saveError(IdempotencyKey key, Throwable error, Duration defaultTtl) {
         if (defaultTtl == null) {
@@ -350,6 +471,20 @@ public class JdbcIdempotencyStore<T> implements IdempotencyStore<T> {
         }
     }
 
+    /**
+     * Retrieves the current state of an idempotency record without acquiring a lock.
+     * <p>
+     * Returns the record if it exists and is still valid (not expired). For EXECUTED records,
+     * checks if TTL has expired. For LOCKED records, checks if lock has expired.
+     * FAILED records are always returned regardless of TTL, as they represent terminal state.
+     * <p>
+     * This method is safe for read-only operations and does not interfere with concurrent
+     * lock acquisition or result/error saving.
+     *
+     * @param key the idempotency key to look up
+     * @return an Optional containing the record if found and valid, or empty if not found or expired
+     * @throws RuntimeException if a database or deserialization error occurs
+     */
     @Override
     public Optional<IdempotencyRecord<T>> get(IdempotencyKey key) {
         long now = System.currentTimeMillis();
@@ -418,22 +553,50 @@ public class JdbcIdempotencyStore<T> implements IdempotencyStore<T> {
         return new Builder<>();
     }
 
+    /**
+     * Builder for creating {@link JdbcIdempotencyStore} instances.
+     * <p>
+     * Ensures all required parameters are set before building. The {@code resultType} is mandatory
+     * to enable proper JSON deserialization of stored results.
+     *
+     * @param <T> the type of the result object to be serialized/deserialized
+     */
     public static class Builder<T> {
         private DataSource dataSource;
         private ObjectMapper objectMapper = new ObjectMapper();
         private String tableName = "idempotency_records";
         private Class<T> resultType;
 
+        /**
+         * Sets the JDBC data source for database connections.
+         *
+         * @param dataSource the data source (must not be null)
+         * @return this builder
+         */
         public Builder<T> dataSource(DataSource dataSource) {
             this.dataSource = Objects.requireNonNull(dataSource, "dataSource must not be null");
             return this;
         }
 
+        /**
+         * Sets the ObjectMapper for JSON serialization/deserialization.
+         * Defaults to a new instance if not provided.
+         *
+         * @param objectMapper the ObjectMapper (must not be null)
+         * @return this builder
+         */
         public Builder<T> objectMapper(ObjectMapper objectMapper) {
             this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper must not be null");
             return this;
         }
 
+        /**
+         * Sets the name of the idempotency table in the database.
+         * Defaults to "idempotency_records".
+         *
+         * @param tableName the table name (must not be null or empty)
+         * @return this builder
+         */
         public Builder<T> tableName(String tableName) {
             if (tableName == null || tableName.trim().isEmpty()) {
                 throw new IllegalArgumentException("tableName must not be null or empty");
@@ -454,6 +617,12 @@ public class JdbcIdempotencyStore<T> implements IdempotencyStore<T> {
             return this;
         }
 
+        /**
+         * Constructs a new {@link JdbcIdempotencyStore} instance with the configured parameters.
+         *
+         * @return a fully configured JdbcIdempotencyStore
+         * @throws IllegalStateException if required fields (dataSource, resultType) are not set
+         */
         public JdbcIdempotencyStore<T> build() {
             if (dataSource == null) {
                 throw new IllegalStateException("dataSource must be set");
